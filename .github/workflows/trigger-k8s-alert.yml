@@ -8,7 +8,7 @@ on:
         type: boolean
         default: true
   schedule:
-    - cron: "0 9 * * 1"  # every Monday 9am UTC
+    - cron: "0 9 * * 1"  # Every Monday at 9:00 AM UTC
 
 permissions:
   contents: read
@@ -22,13 +22,15 @@ jobs:
       DD_API_KEY: ${{ secrets.DD_API_KEY }}
       DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
       DD_SITE: datadoghq.com
+      DD_DASHBOARD_ID: ${{ secrets.DD_K8S_ALERT_DASHBOARD_ID }}
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
       SLACK_DEVS_ALERTS_CHANNEL_ID: C09S7GDG60J
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -36,7 +38,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -44,42 +46,58 @@ jobs:
             uv.lock
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Install project
+      - name: Install Project Dependencies
         run: uv sync --frozen
 
-      - name: Trigger pipeline failure via centralized config (~10s)
+      - name: Trigger Pipeline Failure via Centralized Config (~10s)
         id: trigger
         run: |
           echo "trigger_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          
           set +e
           uv run python -m tests.e2e.kubernetes.trigger_alert | tee /tmp/trigger.log
           trigger_exit=${PIPESTATUS[0]}
           set -e
+          
           echo "trigger_completed_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          
           if grep -q '"status": "accepted_timeout"' /tmp/trigger.log; then
             echo "trigger_accepted_timeout=true" >> "$GITHUB_OUTPUT"
           else
             echo "trigger_accepted_timeout=false" >> "$GITHUB_OUTPUT"
           fi
+          
           exit "$trigger_exit"
 
-      - name: Report trigger result
+      - name: Report Trigger Execution Result
+        if: always()
         run: |
-          echo "Trigger command completed successfully"
+          echo "Trigger step output log standard check completed."
 
       - name: Verify Datadog + Slack (~5 min)
-        if: ${{ inputs.verify == true || github.event_name == 'schedule' }}
+        if: github.event_name == 'schedule' || inputs.verify == true
         run: |
           POST_TRIGGER_WAIT=""
           if [ "${{ steps.trigger.outputs.trigger_accepted_timeout }}" = "true" ]; then
             POST_TRIGGER_WAIT="--post-trigger-wait 90"
           fi
+          
+          # Using trigger_epoch to ensure logs produced during trigger script are captured
           uv run python -m tests.e2e.kubernetes.trigger_alert \
             --verify-only \
-            --since-epoch ${{ steps.trigger.outputs.trigger_completed_epoch }} \
+            --since-epoch ${{ steps.trigger.outputs.trigger_epoch }} \
             --dd-max-wait 300 \
             $POST_TRIGGER_WAIT
+
+      - name: Publish Alert Dashboard Link
+        if: always() && (github.event_name == 'schedule' || inputs.verify == true)
+        run: |
+          DASHBOARD_URL="https://${DD_SITE}/dashboard/${DD_DASHBOARD_ID}"
+          echo "## 📊 Datadog Monitoring Alert Dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "[View K8s Alert Dashboard](${DASHBOARD_URL})" >> $GITHUB_STEP_SUMMARY
+          
+          echo "Dashboard link generated: ${DASHBOARD_URL}"
